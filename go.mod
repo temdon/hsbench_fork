@@ -1,4 +1,4 @@
-module github.com/markhpc/hsbench
+module github.com/temdon/hsbench_fork
 
 go 1.16
 
