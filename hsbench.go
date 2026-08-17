@@ -901,9 +901,10 @@ func main() {
 			}).DialContext,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: time.Second,
-			// Set the number of idle connections to 2X the number of threads
-			MaxIdleConnsPerHost: 2 * threads,
-			MaxIdleConns:        2 * threads,
+			// Set the number of connections to the number of threads
+			MaxConnsPerHost:     threads,
+			MaxIdleConnsPerHost: threads,
+			MaxIdleConns:        threads,
 			// But limit their idle time to 1 minute
 			IdleConnTimeout: time.Minute,
 			// Ignore TLS errors
