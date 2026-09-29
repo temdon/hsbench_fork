@@ -38,9 +38,10 @@ import (
 )
 
 // Global variables
-var access_key, secret_key, url_host, bucket_prefix, object_prefix, region, modes, output, json_output, sizeArg string
+var access_key, secret_key, url_host, bucket_prefix, object_prefix, region, modes, output, json_output, sizeArg, partSizeArg string
 var buckets []string
-var duration_secs, threads, loops int
+var duration_secs, threads, loops, part_concurrency int
+var part_size int64
 var object_data []byte
 var object_data_md5 string
 var max_keys, running_threads, bucket_count, object_count, object_size, op_counter int64
@@ -294,14 +295,14 @@ type Stats struct {
 	completions int32
 }
 
-func makeStats(loop int, mode string, threads int, intervalNano int64) Stats {
+func makeStats(loop int, mode string, threads int, intervalNano int64) *Stats {
 	start := time.Now().UnixNano()
 	s := Stats{threads, loop, mode, start, 0, intervalNano, []ThreadStats{}, sync.Map{}, 0}
 	for i := 0; i < threads; i++ {
 		s.threadStats = append(s.threadStats, makeThreadStats(start, s.loop, s.mode, s.intervalNano))
 		s.updateIntervals(i)
 	}
-	return s
+	return &s
 }
 
 func (stats *Stats) makeOutputStats(i int64) (OutputStats, bool) {
@@ -346,7 +347,7 @@ func (stats *Stats) makeOutputStats(i int64) (OutputStats, bool) {
 func (stats *Stats) makeTotalStats() (OutputStats, bool) {
 	// Not safe to log if not all writers have completed.
 	completions := atomic.LoadInt32(&stats.completions)
-	if completions < int32(threads) {
+	if completions < int32(stats.threads) {
 		log.Printf("log, completions: %d", completions)
 		return OutputStats{}, false
 	}
@@ -445,7 +446,7 @@ func runUpload(thread_num int, stats *Stats) {
 		}
 		fileobj := bytes.NewReader(object_data)
 
-		key := fmt.Sprintf("%s%012d", prefixes[objnum % int64(prefix_count)], objnum)
+		key := fmt.Sprintf("%s%012d", prefixes[objnum%int64(prefix_count)], objnum)
 		r := &s3.PutObjectInput{
 			Bucket: &buckets[bucket_num],
 			Key:    &key,
@@ -463,7 +464,7 @@ func runUpload(thread_num int, stats *Stats) {
 			errcnt++
 			stats.addSlowDown(thread_num)
 			atomic.AddInt64(&op_counter, -1)
-			log.Printf("upload err", err)
+			log.Printf("upload err: %v", err)
 		} else {
 			// Update the stats
 			stats.addOp(thread_num, object_size, end-start)
@@ -473,6 +474,282 @@ func runUpload(thread_num int, stats *Stats) {
 		}
 	}
 	stats.finish(thread_num)
+	atomic.AddInt64(&running_threads, -1)
+}
+
+// TimedStats is a thread-safe stats collector used by the multipart upload mode.
+// Unlike Stats, an op is assigned to the interval of the wall-clock time at which
+// it is recorded, and intervals are reported by a timer (runReporter), so every
+// interval is logged on time even when single ops take longer than an interval.
+type TimedStats struct {
+	mu           sync.Mutex
+	loop         int
+	mode         string
+	startNano    int64
+	endNano      int64
+	intervalNano int64
+	intervals    []IntervalStats
+}
+
+func makeTimedStats(loop int, mode string, start int64, intervalNano int64) *TimedStats {
+	return &TimedStats{loop: loop, mode: mode, startNano: start, intervalNano: intervalNano}
+}
+
+// current returns the interval for "now". Must be called with mu held: taking
+// the time under the lock guarantees that an op recorded after the reporter has
+// read interval i always lands in interval i+1 or later, so nothing is lost.
+func (ts *TimedStats) current() *IntervalStats {
+	idx := 0
+	if ts.intervalNano > 0 {
+		idx = int((time.Now().UnixNano() - ts.startNano) / ts.intervalNano)
+	}
+	for len(ts.intervals) <= idx {
+		ts.intervals = append(ts.intervals,
+			IntervalStats{ts.loop, strconv.Itoa(len(ts.intervals)), ts.mode, 0, 0, ts.intervalNano, []int64{}})
+	}
+	return &ts.intervals[idx]
+}
+
+func (ts *TimedStats) addOp(bytes int64, latNano int64) {
+	ts.mu.Lock()
+	is := ts.current()
+	is.bytes += bytes
+	is.latNano = append(is.latNano, latNano)
+	ts.mu.Unlock()
+}
+
+func (ts *TimedStats) addSlowDown() {
+	ts.mu.Lock()
+	ts.current().slowdowns++
+	ts.mu.Unlock()
+}
+
+func (ts *TimedStats) finish() {
+	ts.mu.Lock()
+	ts.endNano = time.Now().UnixNano()
+	ts.mu.Unlock()
+}
+
+// intervalOutput builds the output for interval i with the given duration.
+// Intervals with no activity yield zero ops.
+func (ts *TimedStats) intervalOutput(i int, durNano int64) OutputStats {
+	ts.mu.Lock()
+	var bytes, slowdowns int64
+	var lat []int64
+	if i < len(ts.intervals) {
+		bytes = ts.intervals[i].bytes
+		slowdowns = ts.intervals[i].slowdowns
+		lat = append(lat, ts.intervals[i].latNano...)
+	}
+	ts.mu.Unlock()
+	sort.Slice(lat, func(a, b int) bool { return lat[a] < lat[b] })
+	is := IntervalStats{ts.loop, strconv.Itoa(i), ts.mode, bytes, slowdowns, durNano, lat}
+	return is.makeOutputStats()
+}
+
+func (ts *TimedStats) totalOutput() OutputStats {
+	ts.mu.Lock()
+	var bytes, slowdowns int64
+	var lat []int64
+	for i := range ts.intervals {
+		bytes += ts.intervals[i].bytes
+		slowdowns += ts.intervals[i].slowdowns
+		lat = append(lat, ts.intervals[i].latNano...)
+	}
+	dur := ts.endNano - ts.startNano
+	ts.mu.Unlock()
+	sort.Slice(lat, func(a, b int) bool { return lat[a] < lat[b] })
+	is := IntervalStats{ts.loop, "TOTAL", ts.mode, bytes, slowdowns, dur, lat}
+	return is.makeOutputStats()
+}
+
+// runReporter logs one line per TimedStats at every interval boundary until done
+// is closed. It then flushes the remaining intervals (the last one with its
+// actual, possibly shorter duration) and the TOTAL lines, and returns them all.
+func runReporter(all []*TimedStats, start int64, intervalNano int64, done <-chan struct{}) []OutputStats {
+	out := make([]OutputStats, 0)
+	i := 0
+	if intervalNano > 0 {
+	loop:
+		for {
+			wait := start + int64(i+1)*intervalNano - time.Now().UnixNano()
+			timer := time.NewTimer(time.Duration(wait))
+			select {
+			case <-timer.C:
+				for _, ts := range all {
+					o := ts.intervalOutput(i, intervalNano)
+					o.log()
+					out = append(out, o)
+				}
+				i++
+			case <-done:
+				timer.Stop()
+				break loop
+			}
+		}
+	}
+	for _, ts := range all {
+		ts.finish()
+	}
+	if intervalNano > 0 {
+		end := all[0].endNano
+		for ; start+int64(i)*intervalNano < end; i++ {
+			dur := end - (start + int64(i)*intervalNano)
+			if dur > intervalNano {
+				dur = intervalNano
+			}
+			for _, ts := range all {
+				o := ts.intervalOutput(i, dur)
+				o.log()
+				out = append(out, o)
+			}
+		}
+	}
+	for _, ts := range all {
+		o := ts.totalOutput()
+		o.log()
+		out = append(out, o)
+	}
+	return out
+}
+
+// uploadPart uploads a single part of a multipart upload and returns its ETag.
+// Returns the ETag and the number of bytes in the part.
+func uploadPart(svc *s3.S3, bucket, key, uploadId *string, partNum int64) (*string, int64, error) {
+	start := (partNum - 1) * part_size
+	end := start + part_size
+	if end > object_size {
+		end = object_size
+	}
+	r := &s3.UploadPartInput{
+		Bucket:        bucket,
+		Key:           key,
+		UploadId:      uploadId,
+		PartNumber:    aws.Int64(partNum),
+		ContentLength: aws.Int64(end - start),
+		Body:          bytes.NewReader(object_data[start:end]),
+	}
+	req, out := svc.UploadPartRequest(r)
+	// Disable payload checksum calculation (very expensive)
+	req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	if err := req.Send(); err != nil {
+		return nil, 0, err
+	}
+	return out.ETag, end - start, nil
+}
+
+// multipartUploadObject performs Create -> UploadPart x N -> Complete for one object.
+// Parts are uploaded with up to part_concurrency requests in flight.
+// On any failure the upload is aborted so no orphaned parts are left behind.
+// Every part is recorded in partStats.
+func multipartUploadObject(svc *s3.S3, bucket, key *string, partStats *TimedStats) error {
+	create, err := svc.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+		Bucket: bucket,
+		Key:    key,
+	})
+	if err != nil {
+		return fmt.Errorf("create: %v", err)
+	}
+	uploadId := create.UploadId
+
+	numParts := (object_size + part_size - 1) / part_size
+	if numParts == 0 {
+		numParts = 1 // zero-byte object: upload a single empty part
+	}
+	etags := make([]*string, numParts)
+	var nextPart int64 = 0
+	var firstErr error
+	var errOnce sync.Once
+	var failed int32 = 0
+
+	workers := part_concurrency
+	if int64(workers) > numParts {
+		workers = int(numParts)
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for atomic.LoadInt32(&failed) == 0 {
+				idx := atomic.AddInt64(&nextPart, 1) - 1
+				if idx >= numParts {
+					return
+				}
+				pstart := time.Now().UnixNano()
+				etag, n, err := uploadPart(svc, bucket, key, uploadId, idx+1)
+				pend := time.Now().UnixNano()
+				if err != nil {
+					partStats.addSlowDown()
+					errOnce.Do(func() { firstErr = fmt.Errorf("part %d: %v", idx+1, err) })
+					atomic.StoreInt32(&failed, 1)
+					return
+				}
+				partStats.addOp(n, pend-pstart)
+				etags[idx] = etag
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr == nil {
+		parts := make([]*s3.CompletedPart, numParts)
+		for i := int64(0); i < numParts; i++ {
+			parts[i] = &s3.CompletedPart{ETag: etags[i], PartNumber: aws.Int64(i + 1)}
+		}
+		_, err = svc.CompleteMultipartUpload(&s3.CompleteMultipartUploadInput{
+			Bucket:          bucket,
+			Key:             key,
+			UploadId:        uploadId,
+			MultipartUpload: &s3.CompletedMultipartUpload{Parts: parts},
+		})
+		if err == nil {
+			return nil
+		}
+		firstErr = fmt.Errorf("complete: %v", err)
+	}
+
+	if _, aerr := svc.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+		Bucket:   bucket,
+		Key:      key,
+		UploadId: uploadId,
+	}); aerr != nil {
+		log.Printf("multipart abort err for %s/%s: %v", *bucket, *key, aerr)
+	}
+	return firstErr
+}
+
+func runMultipartUpload(stats *TimedStats, partStats *TimedStats) {
+	errcnt := 0
+	svc := s3.New(session.New(), cfg)
+	for {
+		if duration_secs > -1 && time.Now().After(endtime) {
+			break
+		}
+		objnum := atomic.AddInt64(&op_counter, 1)
+		bucket_num := objnum % int64(bucket_count)
+		if object_count > -1 && objnum >= object_count {
+			objnum = atomic.AddInt64(&op_counter, -1)
+			break
+		}
+
+		key := fmt.Sprintf("%s%012d", prefixes[objnum%int64(prefix_count)], objnum)
+		start := time.Now().UnixNano()
+		err := multipartUploadObject(svc, &buckets[bucket_num], &key, partStats)
+		end := time.Now().UnixNano()
+
+		if err != nil {
+			errcnt++
+			stats.addSlowDown()
+			atomic.AddInt64(&op_counter, -1)
+			log.Printf("multipart upload err: %v", err)
+		} else {
+			stats.addOp(object_size, end-start)
+		}
+		if errcnt > 2 {
+			break
+		}
+	}
 	atomic.AddInt64(&running_threads, -1)
 }
 
@@ -491,7 +768,7 @@ func runDownload(thread_num int, fendtime time.Time, stats *Stats) {
 		}
 
 		bucket_num := objnum % int64(bucket_count)
-		key := fmt.Sprintf("%s%012d", prefixes[objnum % int64(prefix_count)], objnum)
+		key := fmt.Sprintf("%s%012d", prefixes[objnum%int64(prefix_count)], objnum)
 		r := &s3.GetObjectInput{
 			Bucket: &buckets[bucket_num],
 			Key:    &key,
@@ -506,7 +783,7 @@ func runDownload(thread_num int, fendtime time.Time, stats *Stats) {
 		if err != nil {
 			errcnt++
 			stats.addSlowDown(thread_num)
-			log.Printf("download err", err)
+			log.Printf("download err: %v", err)
 		} else {
 			io.Copy(ioutil.Discard, resp.Body)
 			resp.Body.Close()
@@ -539,7 +816,7 @@ func runDelete(thread_num int, stats *Stats) {
 
 		bucket_num := objnum % int64(bucket_count)
 
-		key := fmt.Sprintf("%s%012d", prefixes[objnum % int64(prefix_count)], objnum)
+		key := fmt.Sprintf("%s%012d", prefixes[objnum%int64(prefix_count)], objnum)
 		r := &s3.DeleteObjectInput{
 			Bucket: &buckets[bucket_num],
 			Key:    &key,
@@ -554,7 +831,7 @@ func runDelete(thread_num int, stats *Stats) {
 		if err != nil {
 			errcnt++
 			stats.addSlowDown(thread_num)
-			log.Printf("delete err", err, "out", out.String())
+			log.Printf("delete err: %v, out: %s", err, out.String())
 		} else {
 			// Update the stats
 			stats.addOp(thread_num, object_size, end-start)
@@ -664,6 +941,21 @@ func runBucketsClear(thread_num int, stats *Stats) {
 			atomic.AddInt64(&op_counter, -1)
 			break
 		}
+		// Abort incomplete multipart uploads (e.g. from an interrupted mode u run).
+		// Errors are ignored: not every S3 compatible system supports listing uploads.
+		svc.ListMultipartUploadsPages(
+			&s3.ListMultipartUploadsInput{Bucket: &buckets[bucket_num]},
+			func(p *s3.ListMultipartUploadsOutput, last bool) bool {
+				for _, u := range p.Uploads {
+					svc.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+						Bucket:   &buckets[bucket_num],
+						Key:      u.Key,
+						UploadId: u.UploadId,
+					})
+				}
+				return true
+			})
+
 		out, err := svc.ListObjects(&s3.ListObjectsInput{Bucket: &buckets[bucket_num]})
 		if err != nil {
 			break
@@ -697,13 +989,36 @@ func runWrapper(loop int, r rune) []OutputStats {
 	running_threads = int64(threads)
 	intervalNano := int64(interval * 1000000000)
 	endtime = time.Now().Add(time.Second * time.Duration(duration_secs))
-	var stats Stats
+	var stats *Stats
 
 	// If we perviously set the object count after running a put
 	// test, set the object count back to -1 for the new put test.
-	if r == 'p' && object_count_flag {
+	if (r == 'p' || r == 'u') && object_count_flag {
 		object_count = -1
 		object_count_flag = false
+	}
+
+	if r == 'u' {
+		log.Printf("Running Loop %d OBJECT MULTIPART PUT TEST", loop)
+		start := time.Now().UnixNano()
+		mstats := makeTimedStats(loop, "MPUT", start, intervalNano)
+		pstats := makeTimedStats(loop, "MPART", start, intervalNano)
+		for n := 0; n < threads; n++ {
+			go runMultipartUpload(mstats, pstats)
+		}
+		done := make(chan struct{})
+		result := make(chan []OutputStats)
+		go func() { result <- runReporter([]*TimedStats{mstats, pstats}, start, intervalNano, done) }()
+		for atomic.LoadInt64(&running_threads) > 0 {
+			time.Sleep(time.Millisecond)
+		}
+		close(done)
+		os := <-result
+		if object_count < 0 {
+			object_count = op_counter + 1
+			object_count_flag = true
+		}
+		return os
 	}
 
 	switch r {
@@ -711,43 +1026,43 @@ func runWrapper(loop int, r rune) []OutputStats {
 		log.Printf("Running Loop %d BUCKET CLEAR TEST", loop)
 		stats = makeStats(loop, "BCLR", threads, intervalNano)
 		for n := 0; n < threads; n++ {
-			go runBucketsClear(n, &stats)
+			go runBucketsClear(n, stats)
 		}
 	case 'x':
 		log.Printf("Running Loop %d BUCKET DELETE TEST", loop)
 		stats = makeStats(loop, "BDEL", threads, intervalNano)
 		for n := 0; n < threads; n++ {
-			go runBucketDelete(n, &stats)
+			go runBucketDelete(n, stats)
 		}
 	case 'i':
 		log.Printf("Running Loop %d BUCKET INIT TEST", loop)
 		stats = makeStats(loop, "BINIT", threads, intervalNano)
 		for n := 0; n < threads; n++ {
-			go runBucketsInit(n, &stats)
+			go runBucketsInit(n, stats)
 		}
 	case 'p':
 		log.Printf("Running Loop %d OBJECT PUT TEST", loop)
 		stats = makeStats(loop, "PUT", threads, intervalNano)
 		for n := 0; n < threads; n++ {
-			go runUpload(n, &stats)
+			go runUpload(n, stats)
 		}
 	case 'l':
 		log.Printf("Running Loop %d BUCKET LIST TEST", loop)
 		stats = makeStats(loop, "LIST", threads, intervalNano)
 		for n := 0; n < threads; n++ {
-			go runBucketList(n, &stats)
+			go runBucketList(n, stats)
 		}
 	case 'g':
 		log.Printf("Running Loop %d OBJECT GET TEST", loop)
 		stats = makeStats(loop, "GET", threads, intervalNano)
 		for n := 0; n < threads; n++ {
-			go runDownload(n, endtime, &stats)
+			go runDownload(n, endtime, stats)
 		}
 	case 'd':
 		log.Printf("Running Loop %d OBJECT DELETE TEST", loop)
 		stats = makeStats(loop, "DEL", threads, intervalNano)
 		for n := 0; n < threads; n++ {
-			go runDelete(n, &stats)
+			go runDelete(n, stats)
 		}
 	}
 
@@ -758,12 +1073,17 @@ func runWrapper(loop int, r rune) []OutputStats {
 
 	// If the user didn't set the object_count, we can set it here
 	// to limit subsequent get/del tests to valid objects only.
-	if r == 'p' && object_count < 0 {
+	if (r == 'p' || r == 'u') && object_count < 0 {
 		object_count = op_counter + 1
 		object_count_flag = true
 	}
 
 	// Create the Output Stats
+	return stats.collectOutputStats()
+}
+
+// collectOutputStats gathers all interval stats plus the TOTAL line (which is also logged).
+func (stats *Stats) collectOutputStats() []OutputStats {
 	os := make([]OutputStats, 0)
 	for i := int64(0); i >= 0; i++ {
 		if o, ok := stats.makeOutputStats(i); ok {
@@ -801,6 +1121,8 @@ func init() {
 	myflag.IntVar(&loops, "l", 1, "Number of times to repeat test")
 	myflag.StringVar(&sizeArg, "z", "1M", "Size of objects in bytes with postfix K, M, and G")
 	myflag.Float64Var(&interval, "ri", 1.0, "Number of seconds between report intervals")
+	myflag.StringVar(&partSizeArg, "ps", "5M", "Part size for multipart upload (mode u) with postfix K, M, and G")
+	myflag.IntVar(&part_concurrency, "pc", 1, "Number of parts uploaded in parallel per object in multipart upload (mode u)")
 	// define custom usage output with notes
 	notes :=
 		`
@@ -810,14 +1132,29 @@ NOTES:
     x: delete buckets
     i: initialize buckets 
     p: put objects in buckets
+    u: put objects in buckets using multipart upload (see -ps and -pc)
     l: list objects in buckets
     g: get objects from buckets
-    d: delete objects from buckets 
+    d: delete objects from buckets
 
     These modes are processed in-order and can be repeated, ie "ippgd" will
     initialize the buckets, put the objects, reput the objects, get the
     objects, and then delete the objects.  The repeat flag will repeat this
     whole process the specified number of times.
+
+  - Multipart upload (mode u) splits each -z sized object into -ps sized
+    parts (the last part may be smaller) and uploads up to -pc parts of an
+    object concurrently. One op = CreateMultipartUpload + all UploadPart
+    calls + CompleteMultipartUpload, so latency and MB/s are directly
+    comparable with mode p. Total concurrent requests = -t * -pc.
+    Mode u reports two lines at every interval, on a fixed timer:
+      MPUT  - whole objects completed in the interval (0 if none finished;
+              an object's bytes all count in the interval it completes in)
+      MPART - all parts completed in the interval across all threads
+              (one op = one UploadPart), i.e. the live transfer rate
+    The TOTAL lines give the averages over the whole test.
+    AWS requires parts of at least 5 MiB (except the last) and at most
+    10000 parts per object; some S3 compatible systems are more lenient.
 
   - When performing bucket listings, many S3 storage systems limit the
     maximum number of keys returned to 1000 even if MaxKeys is set higher.
@@ -853,6 +1190,7 @@ NOTES:
 		if r != 'i' &&
 			r != 'c' &&
 			r != 'p' &&
+			r != 'u' &&
 			r != 'g' &&
 			r != 'l' &&
 			r != 'd' &&
@@ -871,6 +1209,28 @@ NOTES:
 		log.Fatalf("Invalid -z argument for object size: %v", err)
 	}
 	object_size = int64(size)
+
+	// Multipart upload parameters
+	if size, err = bytefmt.ToBytes(partSizeArg); err != nil {
+		log.Fatalf("Invalid -ps argument for part size: %v", err)
+	}
+	part_size = int64(size)
+	if part_size <= 0 {
+		log.Fatal("Part size -ps must be greater than 0")
+	}
+	if part_concurrency < 1 {
+		log.Fatal("Part concurrency -pc must be at least 1")
+	}
+	if strings.ContainsRune(modes, 'u') {
+		numParts := (object_size + part_size - 1) / part_size
+		if numParts > 10000 {
+			log.Fatalf("Object size %s with part size %s gives %d parts; S3 allows at most 10000. Increase -ps.",
+				sizeArg, partSizeArg, numParts)
+		}
+		if part_size < 5*1024*1024 && numParts > 1 {
+			log.Printf("WARNING: part size %s is below the S3 minimum of 5 MiB; AWS will reject CompleteMultipartUpload, some S3 compatible systems may accept it.", partSizeArg)
+		}
+	}
 }
 
 func initData() {
@@ -884,7 +1244,13 @@ func initData() {
 
 func main() {
 	// Hello
-	log.Printf("Hotsauce S3 Benchmark Version 0.1")
+	log.Printf("Hotsauce S3 Benchmark")
+
+	// Multipart mode may have up to part_concurrency requests in flight per thread
+	max_conns := threads
+	if strings.ContainsRune(modes, 'u') {
+		max_conns = threads * part_concurrency
+	}
 
 	cfg = &aws.Config{
 		Endpoint:    aws.String(url_host),
@@ -902,9 +1268,9 @@ func main() {
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: time.Second,
 			// Set the number of connections to the number of threads
-			MaxConnsPerHost:     threads,
-			MaxIdleConnsPerHost: threads,
-			MaxIdleConns:        threads,
+			MaxConnsPerHost:     max_conns,
+			MaxIdleConnsPerHost: max_conns,
+			MaxIdleConns:        max_conns,
 			// But limit their idle time to 1 minute
 			IdleConnTimeout: time.Minute,
 			// Ignore TLS errors
@@ -930,6 +1296,10 @@ func main() {
 	log.Printf("loops=%d", loops)
 	log.Printf("size=%s", sizeArg)
 	log.Printf("interval=%f", interval)
+	if strings.ContainsRune(modes, 'u') {
+		log.Printf("part_size=%s", partSizeArg)
+		log.Printf("part_concurrency=%d", part_concurrency)
+	}
 
 	// Init Data
 	initData()
