@@ -77,8 +77,12 @@ OPTIONS:
         Write CSV output to this file
   -op string
         Prefix for objects
+  -pc int
+        Number of parts uploaded in parallel per object in multipart upload (mode u) (default 1)
   -prefix_count uint
         Number of prefixes to distribute IOs across. Use only with single bucket (default 1)
+  -ps string
+        Part size for multipart upload (mode u) with postfix K, M, and G (default "5M")
   -r string
         Region for testing (default "us-east-1")
   -ri float
@@ -100,6 +104,7 @@ NOTES:
     x: delete buckets
     i: initialize buckets
     p: put objects in buckets
+    u: put objects in buckets using multipart upload (see -ps and -pc)
     l: list objects in buckets
     g: get objects from buckets
     d: delete objects from buckets
@@ -108,6 +113,20 @@ NOTES:
     initialize the buckets, put the objects, reput the objects, get the
     objects, and then delete the objects.  The repeat flag will repeat this
     whole process the specified number of times.
+
+  - Multipart upload (mode u) splits each -z sized object into -ps sized
+    parts (the last part may be smaller) and uploads up to -pc parts of an
+    object concurrently. One op = CreateMultipartUpload + all UploadPart
+    calls + CompleteMultipartUpload, so latency and MB/s are directly
+    comparable with mode p. Total concurrent requests = -t * -pc.
+    Mode u reports two lines at every interval, on a fixed timer:
+      MPUT  - whole objects completed in the interval (0 if none finished;
+              an object's bytes all count in the interval it completes in)
+      MPART - all parts completed in the interval across all threads
+              (one op = one UploadPart), i.e. the live transfer rate
+    The TOTAL lines give the averages over the whole test.
+    AWS requires parts of at least 5 MiB (except the last) and at most
+    10000 parts per object; some S3 compatible systems are more lenient.
 
   - When performing bucket listings, many S3 storage systems limit the
     maximum number of keys returned to 1000 even if MaxKeys is set higher.
@@ -182,6 +201,19 @@ $ ./hsbench -a 3JZ0SVK94Z55OZU5J1N0 -s OdzEPyDDZ0ls1haDUu1NVWkJDcnG74Lb7XylfXRM 
 2019/08/19 11:21:35 Running Loop 0 BUCKET DELETE TEST
 2019/08/19 11:21:35 Loop: 0, Int: TOTAL, Dur(s): 0.0, Mode: BDEL, Ops: 10, MB/s: 0.00, IO/s: 250, Lat(ms): [ min: 35.1, avg: 37.1, 99%: 39.4, max: 39.4 ], Slowdowns: 0
 ```
+
+## Multipart Upload Example
+
+Upload 64 MiB objects as 8 MiB parts, 4 parts in flight per object, 8 threads,
+then read them back and clean up. Mode `c` also aborts any incomplete multipart
+uploads left behind by an interrupted run.
+
+```
+$ ./hsbench -a <key> -s <secret> -u http://127.0.0.1:7480 -z 64M -ps 8M -pc 4 -t 8 -d 30 -m cxiugdx
+```
+
+Whole-object results are reported with `Mode: MPUT`, per-part results with `Mode: MPART`. Running `-m cxipudx` (PUT, then MPUT
+over the same keys) is a quick way to compare single PUT and multipart throughput.
 
 One notable point is that like the s3-benchmark program it is based on, hsbench has relatively low CPU overhead compared to some other S3 benchmarks.  During the 4K PUT phase of the above test:
 
